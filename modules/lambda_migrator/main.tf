@@ -33,6 +33,8 @@ resource "aws_iam_role_policy" "lambda_sqs_policy" {
           "sqs:ReceiveMessage",
           "sqs:DeleteMessage",
           "sqs:DeleteMessageBatch",
+          "sqs:ChangeMessageVisibility",
+          "sqs:ChangeMessageVisibilityBatch",
         ]
         Resource = "arn:aws:sqs:${var.region}:${var.root_account_id}:*"
       },
@@ -63,5 +65,6 @@ resource "aws_lambda_function" "sqs_migrator" {
   runtime          = "python3.12"
   filename         = data.archive_file.lambda_zip.output_path
   source_code_hash = data.archive_file.lambda_zip.output_base64sha256
-  timeout          = 900 # maximum Lambda timeout (15 min) to handle large queues
+  timeout          = 900  # maximum Lambda timeout (15 min) to handle large queues
+  memory_size      = 512  # half-vCPU for comfortable scheduling of 20+ threads per queue
 }

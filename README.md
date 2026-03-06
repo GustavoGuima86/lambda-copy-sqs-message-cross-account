@@ -73,6 +73,7 @@ terraform apply \
 | `environment` | string | Yes | Queue name prefix to target. Must be `staging` or `prod` (or any prefix used in your queue names). The Lambda searches for all queues starting with `<environment>-`. |
 | `target_account_id` | string | Yes | 12-digit AWS account ID of the workload account to migrate queues into. |
 | `mode` | string | No | `"move"` *(default)* — copies messages then deletes them from source. `"copy"` — copies messages and **leaves the source intact**. See deduplication notes below. |
+| `blacklisted_queues` | list\<string\> | No | Exact queue names to skip entirely. Queues in this list are neither migrated nor reported in `only_in_source`/`only_in_target`. They appear in the `blacklisted` field of the response. |
 
 ### Deduplication in `copy` mode
 
@@ -96,6 +97,19 @@ When using `"mode": "copy"`, messages are **not** deleted from the source. To av
   "environment": "staging",
   "target_account_id": "123456789012",
   "mode": "move"
+}
+```
+
+**With a blacklist:**
+```json
+{
+  "environment": "staging",
+  "target_account_id": "123456789012",
+  "mode": "move",
+  "blacklisted_queues": [
+    "staging-pe-v1-legacy-queue.fifo",
+    "staging-pe-v1-test-queue.fifo"
+  ]
 }
 ```
 
@@ -158,8 +172,9 @@ cat response.json
 |---|---|
 | `migrated` | Queues successfully drained from source to target, with the message count per queue. |
 | `migration_errors` | Queues that matched but failed during migration, with the error reason. |
-| `only_in_source` | Queue names found in the root account but missing in the workload account. |
-| `only_in_target` | Queue names found in the workload account but missing in the root account. |
+| `only_in_source` | Queue names found in the root account but missing in the workload account (blacklisted queues excluded). |
+| `only_in_target` | Queue names found in the workload account but missing in the root account (blacklisted queues excluded). |
+| `blacklisted` | Queue names that were found in either account but skipped due to the `blacklisted_queues` input. |
 
 ---
 
