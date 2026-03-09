@@ -73,6 +73,7 @@ terraform apply \
 | `environment` | string | Yes | Queue name prefix to target. Must be `staging` or `prod` (or any prefix used in your queue names). The Lambda searches for all queues starting with `<environment>-`. |
 | `target_account_id` | string | Yes | 12-digit AWS account ID of the workload account to migrate queues into. |
 | `mode` | string | No | `"move"` *(default)* — copies messages then deletes them from source. `"copy"` — copies messages and **leaves the source intact**. See deduplication notes below. |
+| `dry_run` | boolean | No | `false` *(default)*. When `true`, **no messages are copied or moved**. The response contains queue discovery results and approximate message counts per matched queue so you can preview what would happen. |
 | `blacklisted_queues` | list\<string\> | No | Exact queue names to skip entirely. Queues in this list are neither migrated nor reported in `only_in_source`/`only_in_target`. They appear in the `blacklisted` field of the response. |
 
 ### Deduplication in `copy` mode
@@ -90,6 +91,15 @@ When using `"mode": "copy"`, messages are **not** deleted from the source. To av
 ---
 
 ### JSON payload examples
+
+**Dry run (preview only — nothing is moved):**
+```json
+{
+  "environment": "staging",
+  "target_account_id": "123456789012",
+  "dry_run": true
+}
+```
 
 **Move staging queues (default — source is drained):**
 ```json
@@ -170,8 +180,9 @@ cat response.json
 
 | Field | Description |
 |---|---|
-| `migrated` | Queues successfully drained from source to target, with the message count per queue. |
-| `migration_errors` | Queues that matched but failed during migration, with the error reason. |
+| `dry_run` | `true` when dry run mode was active — no messages were touched. |
+| `migrated` | Queues successfully drained from source to target, with actual message count (`messages_copied`). In dry run mode: approximate count (`messages_approximate`) from `GetQueueAttributes`. |
+| `migration_errors` | Queues that matched but failed during migration (or failed to retrieve count in dry run mode). |
 | `only_in_source` | Queue names found in the root account but missing in the workload account (blacklisted queues excluded). |
 | `only_in_target` | Queue names found in the workload account but missing in the root account (blacklisted queues excluded). |
 | `blacklisted` | Queue names that were found in either account but skipped due to the `blacklisted_queues` input. |
