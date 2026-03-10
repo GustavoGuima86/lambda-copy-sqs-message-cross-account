@@ -1,7 +1,9 @@
 import os
+import threading
 import boto3
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -10,8 +12,9 @@ logger.setLevel(logging.INFO)
 WORKLOAD_ROLE_NAME = "sqs-migration-workload-role"
 
 # Concurrency tuning
-WORKERS_PER_QUEUE = 20  # parallel receive→send pipelines draining the same queue
-QUEUE_PARALLELISM = 5   # max queues migrated simultaneously
+WORKERS_PER_QUEUE = 50   # parallel receive→send pipelines draining the same queue
+QUEUE_PARALLELISM = 10  # max queues migrated simultaneously
+SEND_RETRIES = 2         # retries for failed send_message_batch entries
 
 
 def _assume_workload_role(target_account_id: str) -> dict:
@@ -53,6 +56,28 @@ def _list_queues_by_prefix(sqs, prefix: str) -> dict[str, str]:
     return queues
 
 
+def _resolve_queues_by_name(sqs, names: list) -> dict:
+    """
+    Return {queue_name: queue_url} for an explicit list of queue names.
+    Names that don't exist are skipped; any other error (e.g. access denied) is
+    logged and re-raised so the caller can surface a clear failure.
+    """
+    import botocore.exceptions
+    queues: dict = {}
+    for name in names:
+        try:
+            resp = sqs.get_queue_url(QueueName=name)
+            queues[name] = resp["QueueUrl"]
+        except botocore.exceptions.ClientError as exc:
+            code = exc.response["Error"]["Code"]
+            if code in ("AWS.SimpleQueueService.NonExistentQueue", "QueueDoesNotExist"):
+                logger.warning(f"Queue not found, skipping: {name}")
+            else:
+                logger.error(f"Unexpected error resolving queue '{name}': {code} — {exc}")
+                raise
+    return queues
+
+
 def _get_message_count(sqs, queue_url: str) -> int:
     """Return ApproximateNumberOfMessages for a queue without touching any messages."""
     attrs = sqs.get_queue_attributes(
@@ -64,17 +89,25 @@ def _get_message_count(sqs, queue_url: str) -> int:
 
 def _drain_worker(
     region: str,
-    src_creds: dict | None,
+    src_creds: Optional[dict],
     dst_creds: dict,
     src_url: str,
     dst_url: str,
     is_fifo: bool,
     delete_source: bool,
+    processed_ids: Optional[set] = None,
+    processed_ids_lock: Optional[threading.Lock] = None,
 ) -> int:
     """
     One concurrent drain pipeline. Creates its own boto3 clients so threads
     never share mutable client state.
     Returns the count of messages successfully forwarded.
+
+    In copy mode, processed_ids / processed_ids_lock are shared across all workers
+    for the same queue. Each MessageId is forwarded exactly once: once a message is
+    added to processed_ids by any worker, all subsequent workers that receive it
+    release it back to visible and skip forwarding. A worker stops when an entire
+    received batch consists only of already-seen messages (full-pass sentinel).
     """
     sqs_src = _sqs_client(region, src_creds)
     sqs_dst = _sqs_client(region, dst_creds)
@@ -94,6 +127,33 @@ def _drain_worker(
         if not messages:
             break
 
+        # Copy mode: deduplicate across concurrent workers using the shared set.
+        if processed_ids is not None:
+            new_messages = []
+            already_seen = []
+            with processed_ids_lock:
+                for msg in messages:
+                    if msg["MessageId"] not in processed_ids:
+                        processed_ids.add(msg["MessageId"])
+                        new_messages.append(msg)
+                    else:
+                        already_seen.append(msg)
+
+            # Release already-seen messages immediately so they don't occupy in-flight slots.
+            if already_seen:
+                release_entries = [
+                    {"Id": m["MessageId"], "ReceiptHandle": m["ReceiptHandle"], "VisibilityTimeout": 0}
+                    for m in already_seen
+                ]
+                sqs_src.change_message_visibility_batch(QueueUrl=src_url, Entries=release_entries)
+
+            if not new_messages:
+                # Every message in this batch was already forwarded by another worker.
+                # This is the sentinel that we've completed a full pass of the queue.
+                break
+
+            messages = new_messages
+
         send_entries = []
         for msg in messages:
             entry: dict = {
@@ -109,8 +169,21 @@ def _drain_worker(
                 entry["MessageDeduplicationId"] = msg["MessageId"]
             send_entries.append(entry)
 
-        send_resp = sqs_dst.send_message_batch(QueueUrl=dst_url, Entries=send_entries)
-        successful_ids = {r["Id"] for r in send_resp.get("Successful", [])}
+        # Send with retry for individual failed entries.
+        remaining = send_entries
+        successful_ids: set[str] = set()
+        for attempt in range(SEND_RETRIES + 1):
+            send_resp = sqs_dst.send_message_batch(QueueUrl=dst_url, Entries=remaining)
+            successful_ids |= {r["Id"] for r in send_resp.get("Successful", [])}
+            failed = send_resp.get("Failed", [])
+            if not failed or attempt == SEND_RETRIES:
+                break
+            remaining = [
+                e for e in remaining
+                if e["Id"] in {f["Id"] for f in failed if not f.get("SenderFault", False)}
+            ]
+            if not remaining:
+                break
 
         if delete_source:
             delete_entries = [
@@ -121,10 +194,8 @@ def _drain_worker(
             if delete_entries:
                 sqs_src.delete_message_batch(QueueUrl=src_url, Entries=delete_entries)
         else:
-            # Copy mode: release messages back to visible immediately after forwarding.
-            # This keeps the in-flight count near zero, avoiding the SQS limit of
-            # 120k (standard) / 20k (FIFO) in-flight messages — critical for queues
-            # with hundreds of thousands of messages.
+            # Copy mode: release forwarded messages back to visible immediately.
+            # Keeps in-flight count near zero (SQS limit: 120k standard / 20k FIFO).
             release_entries = [
                 {"Id": m["MessageId"], "ReceiptHandle": m["ReceiptHandle"], "VisibilityTimeout": 0}
                 for m in messages
@@ -140,7 +211,7 @@ def _drain_worker(
 
 def _migrate_queue(
     region: str,
-    src_creds: dict | None,
+    src_creds: Optional[dict],
     dst_creds: dict,
     src_url: str,
     dst_url: str,
@@ -151,12 +222,17 @@ def _migrate_queue(
     total = 0
     worker_errors = []
 
+    # In copy mode, share a set across workers so each MessageId is forwarded exactly once.
+    processed_ids = set() if not delete_source else None
+    processed_ids_lock = threading.Lock() if not delete_source else None
+
     with ThreadPoolExecutor(max_workers=WORKERS_PER_QUEUE) as pool:
         futures = [
             pool.submit(
                 _drain_worker,
                 region, src_creds, dst_creds,
                 src_url, dst_url, is_fifo, delete_source,
+                processed_ids, processed_ids_lock,
             )
             for _ in range(WORKERS_PER_QUEUE)
         ]
@@ -188,6 +264,10 @@ def lambda_handler(event, context):
       - dry_run (bool): when true, no messages are copied or moved. The response contains
                     the same queue discovery results plus the approximate message count
                     per matched queue, so you can preview what would happen.
+      - target_queues_filter (list[str]): optional explicit list of exact queue names to
+                    migrate. When provided, only these queues are looked up (in both accounts
+                    via GetQueueUrl) — the prefix scan is skipped entirely. Queue names that
+                    do not exist in either account are omitted from the response.
       - blacklisted_queues (list[str]): optional list of exact queue names to skip entirely.
                     Blacklisted queues are excluded from migration regardless of whether
                     they exist in source or target, and reported in the response.
@@ -210,6 +290,7 @@ def lambda_handler(event, context):
     target_account_id = event.get("target_account_id")
     mode = event.get("mode", "move")
     dry_run = bool(event.get("dry_run", False))
+    target_queues_filter = event.get("target_queues_filter")  # list[str] | None
     blacklisted_queues = set(event.get("blacklisted_queues", []))
 
     if mode not in ("move", "copy"):
@@ -236,12 +317,18 @@ def lambda_handler(event, context):
 
     sqs_target = _sqs_client(region, workload_creds)
 
-    logger.info(f"Listing source queues with prefix '{prefix}'")
-    source_queues = _list_queues_by_prefix(sqs_source, prefix)
-    logger.info(f"Source queues found: {sorted(source_queues)}")
+    if target_queues_filter:
+        logger.info(f"Resolving {len(target_queues_filter)} explicit queue name(s) in source")
+        source_queues = _resolve_queues_by_name(sqs_source, target_queues_filter)
+        logger.info(f"Resolving {len(target_queues_filter)} explicit queue name(s) in target")
+        target_queues = _resolve_queues_by_name(sqs_target, target_queues_filter)
+    else:
+        logger.info(f"Listing source queues with prefix '{prefix}'")
+        source_queues = _list_queues_by_prefix(sqs_source, prefix)
+        logger.info(f"Listing target queues with prefix '{prefix}'")
+        target_queues = _list_queues_by_prefix(sqs_target, prefix)
 
-    logger.info(f"Listing target queues with prefix '{prefix}'")
-    target_queues = _list_queues_by_prefix(sqs_target, prefix)
+    logger.info(f"Source queues found: {sorted(source_queues)}")
     logger.info(f"Target queues found: {sorted(target_queues)}")
 
     source_names = set(source_queues)

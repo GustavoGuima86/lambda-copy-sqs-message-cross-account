@@ -74,6 +74,7 @@ terraform apply \
 | `target_account_id` | string | Yes | 12-digit AWS account ID of the workload account to migrate queues into. |
 | `mode` | string | No | `"move"` *(default)* — copies messages then deletes them from source. `"copy"` — copies messages and **leaves the source intact**. See deduplication notes below. |
 | `dry_run` | boolean | No | `false` *(default)*. When `true`, **no messages are copied or moved**. The response contains queue discovery results and approximate message counts per matched queue so you can preview what would happen. |
+| `target_queues_filter` | list\<string\> | No | Explicit list of exact queue names to migrate. When provided, **only these queues are looked up** (via `GetQueueUrl` in both accounts) — the prefix scan is skipped entirely. Queues not found in either account are silently omitted. Compatible with `dry_run` and `blacklisted_queues`. |
 | `blacklisted_queues` | list\<string\> | No | Exact queue names to skip entirely. Queues in this list are neither migrated nor reported in `only_in_source`/`only_in_target`. They appear in the `blacklisted` field of the response. |
 
 ### Deduplication in `copy` mode
@@ -119,6 +120,19 @@ When using `"mode": "copy"`, messages are **not** deleted from the source. To av
   "blacklisted_queues": [
     "staging-pe-v1-legacy-queue.fifo",
     "staging-pe-v1-test-queue.fifo"
+  ]
+}
+```
+
+**Migrate only specific queues (prefix scan skipped):**
+```json
+{
+  "environment": "staging",
+  "target_account_id": "123456789012",
+  "mode": "move",
+  "target_queues_filter": [
+    "staging-pe-v1-account-creation.fifo",
+    "staging-pe-v1-order-placed.fifo"
   ]
 }
 ```
